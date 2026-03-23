@@ -1,31 +1,47 @@
 # pi-cryptex
 
-Encrypted secrets management for pi.
+Encrypted secrets and account portability for pi.
 
-`pi-cryptex` gives you a clean split between:
+`pi-cryptex` gives you two vaults with separate passwords:
 
-- project secrets (live with each repo)
-- portable account state (live in your `~/.pi/agent` area)
+- a **per-project vault** for app/repo secrets
+- an **account vault** for your pi login state and multi-pass config
 
-## Vaults
+This keeps project secrets in the project, and your personal pi identity portable across machines.
 
-### Project vault
+## Why two vaults?
 
-- Path: `.cryptex/vault.v1.enc`
-- Purpose: API keys, tokens, project-specific secrets
-- Main tools: `cryptex_vault`, `cryptex_git_sync`
-- Password env var: `PI_CRYPTEX_PROJECT_PASSWORD`
+### Project vault (`.cryptex/vault.v1.enc`)
 
-### Account vault
+Use this for things that belong to one codebase:
 
-- Path: `~/.pi/agent/cryptex-account.v1.enc`
-- Purpose: carry pi auth and multi-pass state across machines
-- Main tools: `cryptex_pi_state`, `cryptex_account_git_sync`
-- Password env var: `PI_CRYPTEX_ACCOUNT_PASSWORD`
+- API keys for that project
+- deployment tokens for that repo
+- environment-specific secrets used by that team
+
+Typical behavior:
+
+- committed with the project repo (encrypted only)
+- shared with teammates who know the project vault password
+- rotated independently from your personal pi account credentials
+
+### Account vault (`~/.pi/agent/cryptex-account.v1.enc`)
+
+Use this for things that belong to **you**, not one repo:
+
+- `auth.json` (pi provider logins)
+- `multi-pass.json` (pi-multi-pass subscriptions/pools/chains)
+- optional account-level settings backup
+
+Typical behavior:
+
+- synced to a separate private repo (for example `hjanuschka/pi-accounts`)
+- restored when setting up a new machine
+- protected with a separate account vault password
 
 ## Install
 
-### Run directly
+### Run directly from this repo
 
 ```bash
 pi -e ./extensions/pi-cryptex.ts
@@ -34,14 +50,27 @@ pi -e ./extensions/pi-cryptex.ts
 ### Install as package
 
 ```bash
-pi install .
+pi install npm:pi-cryptex
 ```
 
-## Recommended commands
+## Passwords
 
-- `/cryptex-project-password` - set or rotate project vault password
-- `/cryptex-account-password` - set or rotate account vault password
-- `/cryptex-info` - show vault locations
+Project vault password:
+
+- env var: `PI_CRYPTEX_PROJECT_PASSWORD`
+- legacy fallback: `PI_CRYPTEX_PASSWORD`
+
+Account vault password:
+
+- env var: `PI_CRYPTEX_ACCOUNT_PASSWORD`
+
+On macOS, passwords are stored in Keychain when entered interactively.
+
+## Commands
+
+- `/cryptex-project-password` - set/rotate project vault password
+- `/cryptex-account-password` - set/rotate account vault password
+- `/cryptex-info` - show both vault locations
 - `/cryptex-backup-pi [profile]` - backup selected `~/.pi/agent` files into account vault
 - `/cryptex-restore-pi [profile]` - restore selected `~/.pi/agent` files from account vault
 
@@ -49,7 +78,7 @@ pi install .
 
 ### `cryptex_vault`
 
-Manage project secrets.
+Per-project secret manager.
 
 Actions:
 
@@ -64,7 +93,7 @@ Actions:
 
 ### `cryptex_git_sync`
 
-Sync project vault with git.
+Project vault git sync.
 
 Actions:
 
@@ -78,7 +107,7 @@ Notes:
 
 ### `cryptex_pi_state`
 
-Backup and restore pi account files in the account vault.
+Backup/restore account state in the account vault.
 
 Actions:
 
@@ -98,34 +127,134 @@ Default restore paths:
 
 ### `cryptex_account_git_sync`
 
-Sync account vault to a dedicated private git repo.
+Sync account vault with a dedicated private git repo.
 
 Actions:
 
 - `push`
 - `pull`
 
-Notes:
+Note: `repoUrl` is required for both actions.
 
-- `repoUrl` is required for both actions.
+## Sample workflows
+
+## 1) Project secret workflow
+
+### Save secret
+
+Prompt:
+
+```text
+Store STRIPE_SECRET in project vault
+```
+
+Explicit tool call shape:
+
+```json
+{
+  "action": "set",
+  "key": "STRIPE_SECRET",
+  "value": "sk_live_..."
+}
+```
+
+### Read secret (masked)
+
+```json
+{
+  "action": "get",
+  "key": "STRIPE_SECRET"
+}
+```
+
+### Read secret (plaintext)
+
+```json
+{
+  "action": "get",
+  "key": "STRIPE_SECRET",
+  "reveal": true
+}
+```
+
+### Push encrypted project vault
+
+```json
+{
+  "action": "push"
+}
+```
+
+(or with dedicated repo)
+
+```json
+{
+  "action": "push",
+  "repoUrl": "git@github.com:your-org/your-project-secrets.git",
+  "branch": "main"
+}
+```
+
+## 2) Account migration workflow
+
+### Backup current machine state
+
+```json
+{
+  "action": "backup",
+  "profile": "laptop"
+}
+```
+
+### Push account vault to private repo
+
+```json
+{
+  "action": "push",
+  "repoUrl": "git@github.com:hjanuschka/pi-accounts.git",
+  "branch": "main"
+}
+```
+
+### On a new machine: pull + restore
+
+Pull:
+
+```json
+{
+  "action": "pull",
+  "repoUrl": "git@github.com:hjanuschka/pi-accounts.git",
+  "branch": "main"
+}
+```
+
+Restore:
+
+```json
+{
+  "action": "restore",
+  "profile": "laptop",
+  "overwrite": true
+}
+```
 
 ## Demo in this repository
 
-This repo includes an encrypted project vault at:
+This repo includes an encrypted project vault:
 
 - `.cryptex/vault.v1.enc`
 
-It contains a demo key named `testkey`.
+It contains a demo key `testkey`.
 
-Example prompt:
+Try:
 
 ```text
 Show me testkey from project vault
 ```
 
-## Security
+## Security notes
 
-- Vault encryption: `aes-256-gcm`
+- Encryption: `aes-256-gcm`
 - Key derivation: `scrypt`
-- `reveal=true` returns plaintext to model context and session history. Use only when needed.
-- Account vault may contain highly sensitive auth material (`auth.json`). Use a strong account password and private git repo.
+- `reveal=true` sends plaintext into model context/session history. Use only when necessary.
+- Account vault includes sensitive auth material (`auth.json`). Use a strong password and a private git repo.
