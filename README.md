@@ -2,17 +2,23 @@
 
 A pi extension inspired by `fastlane-plugin-cryptex`.
 
-It stores project credentials in an encrypted file:
+It now has two independent vaults with separate passwords.
 
-- `.cryptex/vault.v1.enc`
+## Vaults
 
-## Password resolution
+### 1) Project vault (per project)
 
-Master password lookup order:
+- File: `.cryptex/vault.v1.enc` inside your project
+- Password env var: `PI_CRYPTEX_PROJECT_PASSWORD` (legacy fallback: `PI_CRYPTEX_PASSWORD`)
+- Keychain service: `pi-cryptex-project`
+- Use with: `cryptex_vault`, `cryptex_git_sync`
 
-1. `PI_CRYPTEX_PASSWORD`
-2. macOS Keychain (`service=pi-cryptex`, account derived from project path)
-3. interactive prompt (then saved to Keychain on macOS)
+### 2) Account vault (global)
+
+- File: `~/.pi/agent/cryptex-account.v1.enc`
+- Password env var: `PI_CRYPTEX_ACCOUNT_PASSWORD`
+- Keychain service: `pi-cryptex-account`
+- Use with: `cryptex_pi_state`, `cryptex_account_git_sync`
 
 ## Install
 
@@ -30,32 +36,52 @@ pi install .
 
 ## Commands
 
-- `/cryptex-password` - create or rotate master password
-- `/cryptex-info` - show vault file location
-- `/cryptex-backup-pi [profile]` - backup `~/.pi/agent` auth/login state into cryptex
-- `/cryptex-restore-pi [profile]` - restore auth/login state from cryptex
+- `/cryptex-password` - set project password (legacy alias)
+- `/cryptex-project-password` - set/rotate project vault password
+- `/cryptex-account-password` - set/rotate account vault password
+- `/cryptex-info` - show vault file locations
+- `/cryptex-backup-pi [profile]` - backup `~/.pi/agent` auth/login state into account vault
+- `/cryptex-restore-pi [profile]` - restore auth/login state from account vault
 
 ## Tools (all prefixed)
 
 ### `cryptex_vault`
 
+Per-project secret storage.
+
 Actions:
 
-- `set` - set one secret
-- `set_many` - set many secrets from a key/value map
-- `get` - get one secret (masked by default)
-- `get_many` - get many secrets (masked by default)
-- `delete` - delete one secret
-- `list` - list keys
-- `nuke` - delete all keys
-- `rotate_password` - re-encrypt vault with a new password
+- `set`
+- `set_many`
+- `get`
+- `get_many`
+- `delete`
+- `list`
+- `nuke`
+- `rotate_password`
+
+### `cryptex_git_sync`
+
+Project vault git sync.
+
+Actions:
+
+- `push`
+- `pull`
+
+Notes:
+
+- `push` can use current repo when `repoUrl` is omitted.
+- `pull` requires `repoUrl`.
 
 ### `cryptex_pi_state`
 
+Backup and restore selected `~/.pi/agent` files into the account vault.
+
 Actions:
 
-- `backup` - backup selected files from `~/.pi/agent` into cryptex
-- `restore` - restore selected files from cryptex into `~/.pi/agent`
+- `backup`
+- `restore`
 
 Default backup paths:
 
@@ -68,32 +94,21 @@ Default restore paths:
 - `auth.json`
 - `multi-pass.json`
 
-You can override with `paths`.
+### `cryptex_account_git_sync`
 
-### `cryptex_git_sync`
+Account vault git sync (dedicated repo).
 
 Actions:
 
-- `push` - commit/push vault to git (current repo or dedicated remote)
-- `pull` - pull vault from dedicated remote git repo
+- `push`
+- `pull`
 
-## Example prompts
+Notes:
 
-```text
-Backup my pi auth and pi-multi-pass accounts to cryptex profile laptop
-```
-
-```text
-Push the cryptex vault to git@github.com:me/my-cryptex-secrets.git on branch main
-```
-
-```text
-Pull the cryptex vault from git@github.com:me/my-cryptex-secrets.git and restore pi state from profile laptop with overwrite=true
-```
+- `repoUrl` is required for both actions.
 
 ## Security notes
 
-- The vault uses `aes-256-gcm` with `scrypt` key derivation.
-- If `reveal=true` is used for reads, plaintext secrets enter model context/session history.
-- `cryptex_pi_state backup` stores raw contents of files like `auth.json`; keep vault password strong.
-- After restore, restart `pi` if auth or multi-pass state is not picked up immediately.
+- Vault format: `aes-256-gcm` + `scrypt`.
+- If `reveal=true` is used, plaintext enters model context/session history.
+- Account backup includes sensitive files like `auth.json`; keep account vault password strong.
