@@ -1,0 +1,23 @@
+{
+  "name": "pi-cryptex",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi extension inspired by fastlane-plugin-cryptex for encrypted project credentials.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "credentials",
+    "secrets"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/pi-cryptex.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  }
+}
