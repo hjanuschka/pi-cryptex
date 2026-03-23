@@ -1,53 +1,55 @@
 # pi-cryptex
 
-A pi extension inspired by `fastlane-plugin-cryptex`.
+Encrypted secrets management for pi.
 
-It now has two independent vaults with separate passwords.
+`pi-cryptex` gives you a clean split between:
+
+- project secrets (live with each repo)
+- portable account state (live in your `~/.pi/agent` area)
 
 ## Vaults
 
-### 1) Project vault (per project)
+### Project vault
 
-- File: `.cryptex/vault.v1.enc` inside your project
-- Password env var: `PI_CRYPTEX_PROJECT_PASSWORD` (legacy fallback: `PI_CRYPTEX_PASSWORD`)
-- Keychain service: `pi-cryptex-project`
-- Use with: `cryptex_vault`, `cryptex_git_sync`
+- Path: `.cryptex/vault.v1.enc`
+- Purpose: API keys, tokens, project-specific secrets
+- Main tools: `cryptex_vault`, `cryptex_git_sync`
+- Password env var: `PI_CRYPTEX_PROJECT_PASSWORD`
 
-### 2) Account vault (global)
+### Account vault
 
-- File: `~/.pi/agent/cryptex-account.v1.enc`
+- Path: `~/.pi/agent/cryptex-account.v1.enc`
+- Purpose: carry pi auth and multi-pass state across machines
+- Main tools: `cryptex_pi_state`, `cryptex_account_git_sync`
 - Password env var: `PI_CRYPTEX_ACCOUNT_PASSWORD`
-- Keychain service: `pi-cryptex-account`
-- Use with: `cryptex_pi_state`, `cryptex_account_git_sync`
 
 ## Install
 
-### Option A: run directly
+### Run directly
 
 ```bash
 pi -e ./extensions/pi-cryptex.ts
 ```
 
-### Option B: install package
+### Install as package
 
 ```bash
 pi install .
 ```
 
-## Commands
+## Recommended commands
 
-- `/cryptex-password` - set project password (legacy alias)
-- `/cryptex-project-password` - set/rotate project vault password
-- `/cryptex-account-password` - set/rotate account vault password
-- `/cryptex-info` - show vault file locations
-- `/cryptex-backup-pi [profile]` - backup `~/.pi/agent` auth/login state into account vault
-- `/cryptex-restore-pi [profile]` - restore auth/login state from account vault
+- `/cryptex-project-password` - set or rotate project vault password
+- `/cryptex-account-password` - set or rotate account vault password
+- `/cryptex-info` - show vault locations
+- `/cryptex-backup-pi [profile]` - backup selected `~/.pi/agent` files into account vault
+- `/cryptex-restore-pi [profile]` - restore selected `~/.pi/agent` files from account vault
 
-## Tools (all prefixed)
+## Tools
 
 ### `cryptex_vault`
 
-Per-project secret storage.
+Manage project secrets.
 
 Actions:
 
@@ -62,7 +64,7 @@ Actions:
 
 ### `cryptex_git_sync`
 
-Project vault git sync.
+Sync project vault with git.
 
 Actions:
 
@@ -71,12 +73,12 @@ Actions:
 
 Notes:
 
-- `push` can use current repo when `repoUrl` is omitted.
+- `push` can use current repo if `repoUrl` is omitted.
 - `pull` requires `repoUrl`.
 
 ### `cryptex_pi_state`
 
-Backup and restore selected `~/.pi/agent` files into the account vault.
+Backup and restore pi account files in the account vault.
 
 Actions:
 
@@ -86,7 +88,7 @@ Actions:
 Default backup paths:
 
 - `auth.json`
-- `multi-pass.json` (for `pi-multi-pass` subscriptions, pools, chains)
+- `multi-pass.json`
 - `settings.json`
 
 Default restore paths:
@@ -96,7 +98,7 @@ Default restore paths:
 
 ### `cryptex_account_git_sync`
 
-Account vault git sync (dedicated repo).
+Sync account vault to a dedicated private git repo.
 
 Actions:
 
@@ -107,8 +109,23 @@ Notes:
 
 - `repoUrl` is required for both actions.
 
-## Security notes
+## Demo in this repository
 
-- Vault format: `aes-256-gcm` + `scrypt`.
-- If `reveal=true` is used, plaintext enters model context/session history.
-- Account backup includes sensitive files like `auth.json`; keep account vault password strong.
+This repo includes an encrypted project vault at:
+
+- `.cryptex/vault.v1.enc`
+
+It contains a demo key named `testkey`.
+
+Example prompt:
+
+```text
+Show me testkey from project vault
+```
+
+## Security
+
+- Vault encryption: `aes-256-gcm`
+- Key derivation: `scrypt`
+- `reveal=true` returns plaintext to model context and session history. Use only when needed.
+- Account vault may contain highly sensitive auth material (`auth.json`). Use a strong account password and private git repo.
