@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "kdf": "scrypt",
+  "salt": "WuCss3mpCYkxvt4UmhuD6Q==",
+  "iv": "2roR/5JNyaNfwYdB",
+  "tag": "jQ5JHHD70b5rlHOkb8MwXA==",
+  "ciphertext": "NQMdjre3NJOjUIkYOSL447EzE/tQ3tWWayjD70ealr9X5qd2zNfcf491sZc84Usasr3yM0SuRHadS+cWPh21p0wRBnzhO7e28gygSiwFrs+qxoaRvJ9NltElPQd+wopfe1D8qeO4MYfjxd2LTHIdCV/qS1j857C8DHY5tDyaW1RTyhn0mClGaFlIawzhI3f8S4xeqpylDYpidDcaJ9INNyEd2W9WtQ=="
+}
