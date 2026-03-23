@@ -1,7 +1,7 @@
 {
   "name": "pi-cryptex",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "type": "module",
   "description": "Pi extension inspired by fastlane-plugin-cryptex for encrypted project credentials.",
   "keywords": [
