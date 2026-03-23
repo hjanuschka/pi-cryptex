@@ -18,23 +18,8 @@ const PI_STATE_KEY_PREFIX = "pi_state:";
 const PI_DEFAULT_BACKUP_PATHS = ["auth.json", "multi-pass.json", "settings.json"];
 const PI_DEFAULT_RESTORE_PATHS = ["auth.json", "multi-pass.json"];
 
-const CryptexParamsSchema = Type.Object({
-	action: StringEnum(
-		[
-			"set",
-			"set_many",
-			"get",
-			"get_many",
-			"delete",
-			"list",
-			"nuke",
-			"rotate_password",
-			"backup_pi_state",
-			"restore_pi_state",
-			"git_push_vault",
-			"git_pull_vault",
-		] as const,
-	),
+const CryptexVaultParamsSchema = Type.Object({
+	action: StringEnum(["set", "set_many", "get", "get_many", "delete", "list", "nuke", "rotate_password"] as const),
 	key: Type.Optional(Type.String({ description: "Secret key name" })),
 	value: Type.Optional(Type.String({ description: "Secret value for action=set" })),
 	items: Type.Optional(
@@ -49,44 +34,52 @@ const CryptexParamsSchema = Type.Object({
 		}),
 	),
 	newPassword: Type.Optional(Type.String({ description: "New master password for action=rotate_password" })),
+});
+
+const CryptexPiStateParamsSchema = Type.Object({
+	action: StringEnum(["backup", "restore"] as const),
 	profile: Type.Optional(
 		Type.String({
-			description:
-				"Named profile for backup_pi_state/restore_pi_state. Stored under key pi_state:<profile>. Default: default",
+			description: "Named profile for backup/restore. Stored under key pi_state:<profile>. Default: default",
 		}),
 	),
 	paths: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				"Relative paths under ~/.pi/agent for backup_pi_state/restore_pi_state. Backup default: auth.json,multi-pass.json,settings.json. Restore default: auth.json,multi-pass.json",
+				"Relative paths under ~/.pi/agent. Backup default: auth.json,multi-pass.json,settings.json. Restore default: auth.json,multi-pass.json",
 		}),
 	),
 	overwrite: Type.Optional(
 		Type.Boolean({
-			description: "For restore_pi_state. If true, overwrite existing files in ~/.pi/agent.",
-		}),
-	),
-	repoUrl: Type.Optional(
-		Type.String({
-			description:
-				"For git_push_vault/git_pull_vault. Remote git URL (ssh/https) for a dedicated cryptex repo. If omitted in git_push_vault, push in current git repo.",
-		}),
-	),
-	branch: Type.Optional(Type.String({ description: "Optional git branch for git_push_vault/git_pull_vault" })),
-	remotePath: Type.Optional(
-		Type.String({
-			description:
-				"Path to vault file inside git repo for git_push_vault/git_pull_vault. Default: .cryptex/vault.v1.enc",
-		}),
-	),
-	commitMessage: Type.Optional(
-		Type.String({
-			description: "Commit message for git_push_vault. Optional.",
+			description: "For restore. If true, overwrite existing files in ~/.pi/agent.",
 		}),
 	),
 });
 
-type CryptexParams = Static<typeof CryptexParamsSchema>;
+const CryptexGitSyncParamsSchema = Type.Object({
+	action: StringEnum(["push", "pull"] as const),
+	repoUrl: Type.Optional(
+		Type.String({
+			description:
+				"Remote git URL (ssh/https) for a dedicated cryptex repo. If omitted in push, push in current git repo.",
+		}),
+	),
+	branch: Type.Optional(Type.String({ description: "Optional git branch" })),
+	remotePath: Type.Optional(
+		Type.String({
+			description: "Path to vault file inside git repo. Default: .cryptex/vault.v1.enc",
+		}),
+	),
+	commitMessage: Type.Optional(
+		Type.String({
+			description: "Commit message for push. Optional.",
+		}),
+	),
+});
+
+type CryptexVaultParams = Static<typeof CryptexVaultParamsSchema>;
+type CryptexPiStateParams = Static<typeof CryptexPiStateParamsSchema>;
+type CryptexGitSyncParams = Static<typeof CryptexGitSyncParamsSchema>;
 
 interface VaultEntry {
 	value: string;
@@ -336,6 +329,154 @@ const ensureFileExists = async (filePath: string, errorMessage: string): Promise
 	}
 };
 
+const backupPiStateIntoVault = async (
+	ctx: ExtensionContext,
+	vault: VaultData,
+	vaultPath: string,
+	password: string,
+	profile: string,
+	paths: string[],
+) => {
+	const piRoot = getPiAgentRoot();
+	const bundle: PiStateBundle = {
+		version: 1,
+		createdAt: nowIso(),
+		source: "pi-cryptex",
+		files: {},
+	};
+
+	const missing: string[] = [];
+	let added = 0;
+	for (const rel of paths) {
+		const abs = path.join(piRoot, rel);
+		try {
+			const stat = await fs.stat(abs);
+			if (!stat.isFile()) {
+				missing.push(rel);
+				continue;
+			}
+			const content = await fs.readFile(abs);
+			bundle.files[rel] = {
+				encoding: "base64",
+				content: content.toString("base64"),
+				mode: stat.mode & 0o777,
+				modifiedAt: new Date(stat.mtimeMs).toISOString(),
+			};
+			added += 1;
+		} catch (error) {
+			const err = error as NodeJS.ErrnoException;
+			if (err.code === "ENOENT") {
+				missing.push(rel);
+				continue;
+			}
+			throw err;
+		}
+	}
+
+	if (added === 0) {
+		throw new Error(`No pi files found in ${piRoot}. Checked: ${paths.join(", ")}`);
+	}
+
+	const key = `${PI_STATE_KEY_PREFIX}${profile}`;
+	const timestamp = nowIso();
+	const existing = vault.items[key];
+	vault.items[key] = {
+		value: JSON.stringify(bundle),
+		createdAt: existing?.createdAt ?? timestamp,
+		updatedAt: timestamp,
+	};
+	vault.updatedAt = timestamp;
+	await writeVault(vaultPath, vault, password);
+
+	let text = `Backed up ${added} file(s) from ~/.pi/agent to key ${key}.`;
+	if (missing.length > 0) {
+		text += ` Missing: ${missing.join(", ")}.`;
+	}
+	text += ` Commit ${normalizePath(ctx.cwd, vaultPath)} to sync this backup.`;
+
+	return {
+		content: [{ type: "text" as const, text }],
+		details: {
+			action: "backup",
+			profile,
+			storedKey: key,
+			count: added,
+			missing,
+		},
+	};
+};
+
+const restorePiStateFromVault = async (
+	vault: VaultData,
+	profile: string,
+	paths: string[],
+	overwrite: boolean,
+) => {
+	const key = `${PI_STATE_KEY_PREFIX}${profile}`;
+	const entry = vault.items[key];
+	if (!entry) {
+		return {
+			content: [{ type: "text" as const, text: `No backup found for profile ${profile}.` }],
+			details: { action: "restore", profile, restored: [], key },
+		};
+	}
+
+	const bundle = parsePiStateBundle(entry.value);
+	const piRoot = getPiAgentRoot();
+	const missingInBundle: string[] = [];
+	const skippedExisting: string[] = [];
+	const restored: string[] = [];
+
+	for (const rel of paths) {
+		const file = bundle.files[rel];
+		if (!file) {
+			missingInBundle.push(rel);
+			continue;
+		}
+
+		const abs = path.join(piRoot, rel);
+		if (!overwrite) {
+			try {
+				await fs.access(abs);
+				skippedExisting.push(rel);
+				continue;
+			} catch (error) {
+				const err = error as NodeJS.ErrnoException;
+				if (err.code !== "ENOENT") throw err;
+			}
+		}
+
+		await fs.mkdir(path.dirname(abs), { recursive: true });
+		const bytes = Buffer.from(file.content, "base64");
+		await fs.writeFile(abs, bytes, { mode: 0o600 });
+		await fs.chmod(abs, 0o600);
+		restored.push(rel);
+	}
+
+	let text = `Restored ${restored.length} file(s) from ${key} into ~/.pi/agent.`;
+	if (skippedExisting.length > 0) {
+		text += ` Skipped existing (set overwrite=true to replace): ${skippedExisting.join(", ")}.`;
+	}
+	if (missingInBundle.length > 0) {
+		text += ` Missing in backup: ${missingInBundle.join(", ")}.`;
+	}
+	if (restored.includes("auth.json") || restored.includes("multi-pass.json")) {
+		text += " Restart pi if provider auth or pool state does not refresh immediately.";
+	}
+
+	return {
+		content: [{ type: "text" as const, text }],
+		details: {
+			action: "restore",
+			profile,
+			key,
+			restored,
+			skippedExisting,
+			missingInBundle,
+		},
+	};
+};
+
 export default function (pi: ExtensionAPI) {
 	let cachedPassword: string | undefined;
 
@@ -393,56 +534,13 @@ export default function (pi: ExtensionAPI) {
 		description: "Backup ~/.pi/agent auth,multi-pass,settings into cryptex profile",
 		handler: async (args, ctx) => {
 			const profile = normalizeProfile(args || "default");
+			const paths = PI_DEFAULT_BACKUP_PATHS.map(sanitizePiRelativePath);
 			const password = await resolvePassword(ctx);
 			const vaultPath = vaultPathFor(ctx.cwd);
 			const vault = await readVault(vaultPath, password);
-			const piRoot = getPiAgentRoot();
-
-			const bundle: PiStateBundle = {
-				version: 1,
-				createdAt: nowIso(),
-				source: "pi-cryptex",
-				files: {},
-			};
-
-			let added = 0;
-			for (const relRaw of PI_DEFAULT_BACKUP_PATHS) {
-				const rel = sanitizePiRelativePath(relRaw);
-				const abs = path.join(piRoot, rel);
-				try {
-					const stat = await fs.stat(abs);
-					if (!stat.isFile()) continue;
-					const content = await fs.readFile(abs);
-					bundle.files[rel] = {
-						encoding: "base64",
-						content: content.toString("base64"),
-						mode: stat.mode & 0o777,
-						modifiedAt: new Date(stat.mtimeMs).toISOString(),
-					};
-					added += 1;
-				} catch (error) {
-					const err = error as NodeJS.ErrnoException;
-					if (err.code === "ENOENT") continue;
-					throw err;
-				}
-			}
-
-			if (added === 0) {
-				throw new Error(`No pi state files found in ${piRoot}`);
-			}
-
-			const key = `${PI_STATE_KEY_PREFIX}${profile}`;
-			const timestamp = nowIso();
-			const existing = vault.items[key];
-			vault.items[key] = {
-				value: JSON.stringify(bundle),
-				createdAt: existing?.createdAt ?? timestamp,
-				updatedAt: timestamp,
-			};
-			vault.updatedAt = timestamp;
-			await writeVault(vaultPath, vault, password);
-
-			ctx.ui.notify(`Backed up ${added} file(s) from ~/.pi/agent into ${key}`, "info");
+			const result = await backupPiStateIntoVault(ctx, vault, vaultPath, password, profile, paths);
+			const line = result.content[0];
+			ctx.ui.notify(line.type === "text" ? line.text : "Backup finished", "info");
 		},
 	});
 
@@ -450,32 +548,13 @@ export default function (pi: ExtensionAPI) {
 		description: "Restore ~/.pi/agent auth,multi-pass from cryptex profile",
 		handler: async (args, ctx) => {
 			const profile = normalizeProfile(args || "default");
+			const paths = PI_DEFAULT_RESTORE_PATHS.map(sanitizePiRelativePath);
 			const password = await resolvePassword(ctx);
 			const vaultPath = vaultPathFor(ctx.cwd);
 			const vault = await readVault(vaultPath, password);
-			const key = `${PI_STATE_KEY_PREFIX}${profile}`;
-			const entry = vault.items[key];
-			if (!entry) {
-				ctx.ui.notify(`No backup found for profile ${profile}`, "warning");
-				return;
-			}
-
-			const bundle = parsePiStateBundle(entry.value);
-			const piRoot = getPiAgentRoot();
-			let restored = 0;
-			for (const relRaw of PI_DEFAULT_RESTORE_PATHS) {
-				const rel = sanitizePiRelativePath(relRaw);
-				const file = bundle.files[rel];
-				if (!file) continue;
-				const abs = path.join(piRoot, rel);
-				await fs.mkdir(path.dirname(abs), { recursive: true });
-				const bytes = Buffer.from(file.content, "base64");
-				await fs.writeFile(abs, bytes, { mode: 0o600 });
-				await fs.chmod(abs, 0o600);
-				restored += 1;
-			}
-
-			ctx.ui.notify(`Restored ${restored} file(s) into ~/.pi/agent. Restart pi if needed.`, "info");
+			const result = await restorePiStateFromVault(vault, profile, paths, true);
+			const line = result.content[0];
+			ctx.ui.notify(line.type === "text" ? line.text : "Restore finished", "info");
 		},
 	});
 
@@ -483,35 +562,28 @@ export default function (pi: ExtensionAPI) {
 		name: "cryptex_vault",
 		label: "Cryptex Vault",
 		description:
-			"Store and retrieve encrypted credentials in a local project vault. Actions: set, set_many, get, get_many, delete, list, nuke, rotate_password, backup_pi_state, restore_pi_state, git_push_vault, git_pull_vault.",
-		promptSnippet:
-			"Store project credentials in encrypted vault (.cryptex/vault.v1.enc), backup pi auth/multi-pass state, and sync the vault to git.",
+			"Manage encrypted credentials in the local vault file. Actions: set, set_many, get, get_many, delete, list, nuke, rotate_password.",
+		promptSnippet: "Manage encrypted project credentials in .cryptex/vault.v1.enc.",
 		promptGuidelines: [
-			"Use this tool when the user asks to store credentials or keys for this project.",
-			"Avoid reveal=true unless the user explicitly asks to return plaintext secrets in chat.",
-			"Use backup_pi_state and restore_pi_state for migrating pi auth/logins and pi-multi-pass accounts.",
-			"Use git_push_vault and git_pull_vault when the user wants cryptex-like git sync for the encrypted vault.",
+			"Use this tool when the user asks to store or retrieve credentials for this project.",
+			"Avoid reveal=true unless the user explicitly asks to print plaintext secrets.",
 		],
-		parameters: CryptexParamsSchema,
+		parameters: CryptexVaultParamsSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const input = params as CryptexParams;
+			const input = params as CryptexVaultParams;
 			const password = await resolvePassword(ctx);
 			const vaultPath = vaultPathFor(ctx.cwd);
 			const vault = await readVault(vaultPath, password);
 
 			switch (input.action) {
 				case "set": {
-					if (!input.key || input.key.trim().length === 0) {
-						throw new Error("action=set requires key");
-					}
+					if (!input.key || input.key.trim().length === 0) throw new Error("action=set requires key");
 
 					let value = input.value;
 					if ((!value || value.length === 0) && ctx.hasUI) {
 						value = await ctx.ui.input(`Value for ${input.key}`, "Enter secret value");
 					}
-					if (!value || value.length === 0) {
-						throw new Error("action=set requires value");
-					}
+					if (!value || value.length === 0) throw new Error("action=set requires value");
 
 					const timestamp = nowIso();
 					const existing = vault.items[input.key];
@@ -521,18 +593,11 @@ export default function (pi: ExtensionAPI) {
 						updatedAt: timestamp,
 					};
 					vault.updatedAt = timestamp;
-
 					await writeVault(vaultPath, vault, password);
 
 					return {
-						content: [
-							{ type: "text", text: `Stored key ${input.key} in ${normalizePath(ctx.cwd, vaultPath)}.` },
-						],
-						details: {
-							action: "set",
-							key: input.key,
-							created: !existing,
-						},
+						content: [{ type: "text", text: `Stored key ${input.key} in ${normalizePath(ctx.cwd, vaultPath)}.` }],
+						details: { action: "set", key: input.key, created: !existing },
 					};
 				}
 
@@ -557,18 +622,12 @@ export default function (pi: ExtensionAPI) {
 
 					return {
 						content: [{ type: "text", text: `Stored ${updatedKeys.length} secret(s).` }],
-						details: {
-							action: "set_many",
-							keys: updatedKeys,
-						},
+						details: { action: "set_many", keys: updatedKeys },
 					};
 				}
 
 				case "get": {
-					if (!input.key || input.key.trim().length === 0) {
-						throw new Error("action=get requires key");
-					}
-
+					if (!input.key || input.key.trim().length === 0) throw new Error("action=get requires key");
 					const entry = vault.items[input.key];
 					if (!entry) {
 						return {
@@ -580,52 +639,32 @@ export default function (pi: ExtensionAPI) {
 					if (input.reveal) {
 						return {
 							content: [{ type: "text", text: entry.value }],
-							details: {
-								action: "get",
-								key: input.key,
-								found: true,
-								revealed: true,
-								updatedAt: entry.updatedAt,
-							},
+							details: { action: "get", key: input.key, found: true, revealed: true, updatedAt: entry.updatedAt },
 						};
 					}
 
 					return {
 						content: [{ type: "text", text: `${input.key}=${maskSecret(entry.value)} (hidden)` }],
-						details: {
-							action: "get",
-							key: input.key,
-							found: true,
-							revealed: false,
-							updatedAt: entry.updatedAt,
-						},
+						details: { action: "get", key: input.key, found: true, revealed: false, updatedAt: entry.updatedAt },
 					};
 				}
 
 				case "get_many": {
-					const requestedKeys = input.keys && input.keys.length > 0 ? input.keys : Object.keys(vault.items).sort();
+					const requested = input.keys && input.keys.length > 0 ? input.keys : Object.keys(vault.items).sort();
 					const found: Record<string, string> = {};
-					for (const key of requestedKeys) {
+					for (const key of requested) {
 						const entry = vault.items[key];
 						if (!entry) continue;
 						found[key] = input.reveal ? entry.value : maskSecret(entry.value);
 					}
-
 					return {
 						content: [{ type: "text", text: JSON.stringify(found, null, 2) }],
-						details: {
-							action: "get_many",
-							revealed: Boolean(input.reveal),
-							count: Object.keys(found).length,
-						},
+						details: { action: "get_many", revealed: Boolean(input.reveal), count: Object.keys(found).length },
 					};
 				}
 
 				case "delete": {
-					if (!input.key || input.key.trim().length === 0) {
-						throw new Error("action=delete requires key");
-					}
-
+					if (!input.key || input.key.trim().length === 0) throw new Error("action=delete requires key");
 					if (!vault.items[input.key]) {
 						return {
 							content: [{ type: "text", text: `Key ${input.key} not found.` }],
@@ -646,16 +685,8 @@ export default function (pi: ExtensionAPI) {
 				case "list": {
 					const keys = Object.keys(vault.items).sort();
 					return {
-						content: [
-							{
-								type: "text",
-								text: keys.length === 0 ? "No secrets stored yet." : keys.join("\n"),
-							},
-						],
-						details: {
-							action: "list",
-							count: keys.length,
-						},
+						content: [{ type: "text", text: keys.length === 0 ? "No secrets stored yet." : keys.join("\n") }],
+						details: { action: "list", count: keys.length },
 					};
 				}
 
@@ -663,11 +694,7 @@ export default function (pi: ExtensionAPI) {
 					vault.items = {};
 					vault.updatedAt = nowIso();
 					await writeVault(vaultPath, vault, password);
-
-					return {
-						content: [{ type: "text", text: "Deleted all stored keys." }],
-						details: { action: "nuke" },
-					};
+					return { content: [{ type: "text", text: "Deleted all stored keys." }], details: { action: "nuke" } };
 				}
 
 				case "rotate_password": {
@@ -685,270 +712,171 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify("Updated pi-cryptex password in macOS Keychain", "info");
 					}
 
+					return { content: [{ type: "text", text: "Master password rotated." }], details: { action: "rotate_password" } };
+				}
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "cryptex_pi_state",
+		label: "Cryptex Pi State",
+		description:
+			"Backup and restore pi login state and pi-multi-pass config via the encrypted vault. Actions: backup, restore.",
+		promptSnippet: "Backup/restore ~/.pi/agent auth and multi-pass config into cryptex vault profiles.",
+		promptGuidelines: [
+			"Use this tool when user asks to migrate pi logins/accounts between machines.",
+			"By default backup includes auth.json,multi-pass.json,settings.json and restore includes auth.json,multi-pass.json.",
+		],
+		parameters: CryptexPiStateParamsSchema,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const input = params as CryptexPiStateParams;
+			const profile = normalizeProfile(input.profile);
+			const password = await resolvePassword(ctx);
+			const vaultPath = vaultPathFor(ctx.cwd);
+			const vault = await readVault(vaultPath, password);
+
+			if (input.action === "backup") {
+				const paths = (input.paths && input.paths.length > 0 ? input.paths : PI_DEFAULT_BACKUP_PATHS).map(
+					sanitizePiRelativePath,
+				);
+				return backupPiStateIntoVault(ctx, vault, vaultPath, password, profile, paths);
+			}
+
+			const paths = (input.paths && input.paths.length > 0 ? input.paths : PI_DEFAULT_RESTORE_PATHS).map(
+				sanitizePiRelativePath,
+			);
+			return restorePiStateFromVault(vault, profile, paths, Boolean(input.overwrite));
+		},
+	});
+
+	pi.registerTool({
+		name: "cryptex_git_sync",
+		label: "Cryptex Git Sync",
+		description:
+			"Sync the encrypted vault file to git. Actions: push, pull. Supports current repo push or dedicated remote repo sync.",
+		promptSnippet: "Push/pull .cryptex/vault.v1.enc to or from git repositories.",
+		promptGuidelines: [
+			"Use this tool when user asks to store cryptex vault in git, similar to fastlane cryptex.",
+			"For pull, repoUrl is required.",
+		],
+		parameters: CryptexGitSyncParamsSchema,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const input = params as CryptexGitSyncParams;
+			const vaultPath = vaultPathFor(ctx.cwd);
+
+			if (input.action === "push") {
+				await ensureFileExists(vaultPath, `Vault file not found at ${vaultPath}. Store at least one secret first.`);
+				const commitMessage =
+					input.commitMessage?.trim() || `[pi-cryptex] update vault ${new Date().toISOString()}`;
+
+				if (!input.repoUrl || input.repoUrl.trim().length === 0) {
+					// Push in current repository.
+					runGit(ctx.cwd, ["rev-parse", "--is-inside-work-tree"]);
+					const localVaultPath = sanitizeRelativePath(path.relative(ctx.cwd, vaultPath), "vault path");
+					runGit(ctx.cwd, ["add", "--", localVaultPath]);
+					const status = runGit(ctx.cwd, ["status", "--porcelain", "--", localVaultPath]);
+					if (!status.trim()) {
+						return {
+							content: [{ type: "text", text: "Vault is already up to date in current git repository." }],
+							details: { action: "push", mode: "local", changed: false },
+						};
+					}
+
+					runGit(ctx.cwd, ["commit", "-m", commitMessage, "--", localVaultPath]);
+					if (input.branch && input.branch.trim().length > 0) {
+						runGit(ctx.cwd, ["push", "origin", input.branch.trim()]);
+					} else {
+						runGit(ctx.cwd, ["push"]);
+					}
+
 					return {
-						content: [{ type: "text", text: "Master password rotated." }],
-						details: { action: "rotate_password" },
+						content: [{ type: "text", text: `Pushed ${localVaultPath} from current repository.` }],
+						details: { action: "push", mode: "local", changed: true },
 					};
 				}
 
-				case "backup_pi_state": {
-					const profile = normalizeProfile(input.profile);
-					const requested = (input.paths && input.paths.length > 0 ? input.paths : PI_DEFAULT_BACKUP_PATHS).map(
-						sanitizePiRelativePath,
-					);
-					const piRoot = getPiAgentRoot();
-
-					const bundle: PiStateBundle = {
-						version: 1,
-						createdAt: nowIso(),
-						source: "pi-cryptex",
-						files: {},
-					};
-
-					const missing: string[] = [];
-					let added = 0;
-					for (const rel of requested) {
-						const abs = path.join(piRoot, rel);
+				// Push to dedicated remote repo.
+				const repoUrl = input.repoUrl.trim();
+				const branch = input.branch?.trim();
+				const remotePath = sanitizeRelativePath(input.remotePath || VAULT_DEFAULT_GIT_PATH, "remotePath");
+				const workdir = await fs.mkdtemp(path.join(tmpdir(), "pi-cryptex-"));
+				try {
+					runGit(ctx.cwd, ["clone", "--depth", "1", repoUrl, workdir]);
+					if (branch && branch.length > 0) {
 						try {
-							const stat = await fs.stat(abs);
-							if (!stat.isFile()) {
-								missing.push(rel);
-								continue;
-							}
-							const content = await fs.readFile(abs);
-							bundle.files[rel] = {
-								encoding: "base64",
-								content: content.toString("base64"),
-								mode: stat.mode & 0o777,
-								modifiedAt: new Date(stat.mtimeMs).toISOString(),
-							};
-							added += 1;
-						} catch (error) {
-							const err = error as NodeJS.ErrnoException;
-							if (err.code === "ENOENT") {
-								missing.push(rel);
-								continue;
-							}
-							throw err;
+							runGit(workdir, ["checkout", branch]);
+						} catch {
+							runGit(workdir, ["checkout", "-b", branch]);
 						}
 					}
 
-					if (added === 0) {
-						throw new Error(`No pi files found in ${piRoot}. Checked: ${requested.join(", ")}`);
-					}
+					const target = path.join(workdir, remotePath);
+					await fs.mkdir(path.dirname(target), { recursive: true });
+					const bytes = await fs.readFile(vaultPath);
+					await fs.writeFile(target, bytes, { mode: 0o600 });
 
-					const key = `${PI_STATE_KEY_PREFIX}${profile}`;
-					const timestamp = nowIso();
-					const existing = vault.items[key];
-					vault.items[key] = {
-						value: JSON.stringify(bundle),
-						createdAt: existing?.createdAt ?? timestamp,
-						updatedAt: timestamp,
-					};
-					vault.updatedAt = timestamp;
-					await writeVault(vaultPath, vault, password);
-
-					let text = `Backed up ${added} file(s) from ~/.pi/agent to key ${key}.`;
-					if (missing.length > 0) {
-						text += ` Missing: ${missing.join(", ")}.`;
-					}
-					text += ` Commit ${normalizePath(ctx.cwd, vaultPath)} to sync this backup.`;
-
-					return {
-						content: [{ type: "text", text }],
-						details: {
-							action: "backup_pi_state",
-							profile,
-							storedKey: key,
-							count: added,
-							missing,
-						},
-					};
-				}
-
-				case "restore_pi_state": {
-					const profile = normalizeProfile(input.profile);
-					const key = `${PI_STATE_KEY_PREFIX}${profile}`;
-					const entry = vault.items[key];
-					if (!entry) {
+					runGit(workdir, ["add", "--", remotePath]);
+					const status = runGit(workdir, ["status", "--porcelain", "--", remotePath]);
+					if (!status.trim()) {
 						return {
-							content: [{ type: "text", text: `No backup found for profile ${profile}.` }],
-							details: { action: "restore_pi_state", profile, restored: 0, key },
+							content: [{ type: "text", text: `Remote vault at ${remotePath} is already up to date.` }],
+							details: { action: "push", mode: "remote", changed: false, repoUrl },
 						};
 					}
 
-					const bundle = parsePiStateBundle(entry.value);
-					const requested = (input.paths && input.paths.length > 0 ? input.paths : PI_DEFAULT_RESTORE_PATHS).map(
-						sanitizePiRelativePath,
-					);
-					const piRoot = getPiAgentRoot();
-					const missingInBundle: string[] = [];
-					const skippedExisting: string[] = [];
-					const restored: string[] = [];
-
-					for (const rel of requested) {
-						const file = bundle.files[rel];
-						if (!file) {
-							missingInBundle.push(rel);
-							continue;
-						}
-
-						const abs = path.join(piRoot, rel);
-						if (!input.overwrite) {
-							try {
-								await fs.access(abs);
-								skippedExisting.push(rel);
-								continue;
-							} catch (error) {
-								const err = error as NodeJS.ErrnoException;
-								if (err.code !== "ENOENT") throw err;
-							}
-						}
-
-						await fs.mkdir(path.dirname(abs), { recursive: true });
-						const bytes = Buffer.from(file.content, "base64");
-						await fs.writeFile(abs, bytes, { mode: 0o600 });
-						await fs.chmod(abs, 0o600);
-						restored.push(rel);
-					}
-
-					let text = `Restored ${restored.length} file(s) from ${key} into ~/.pi/agent.`;
-					if (skippedExisting.length > 0) {
-						text += ` Skipped existing (set overwrite=true to replace): ${skippedExisting.join(", ")}.`;
-					}
-					if (missingInBundle.length > 0) {
-						text += ` Missing in backup: ${missingInBundle.join(", ")}.`;
-					}
-					if (restored.includes("auth.json") || restored.includes("multi-pass.json")) {
-						text += " Restart pi if provider auth or pool state does not refresh immediately.";
+					runGit(workdir, ["commit", "-m", commitMessage, "--", remotePath]);
+					if (branch && branch.length > 0) {
+						runGit(workdir, ["push", "origin", branch]);
+					} else {
+						runGit(workdir, ["push"]);
 					}
 
 					return {
-						content: [{ type: "text", text }],
-						details: {
-							action: "restore_pi_state",
-							profile,
-							key,
-							restored,
-							skippedExisting,
-							missingInBundle,
-						},
+						content: [{ type: "text", text: `Pushed vault to ${repoUrl} (${remotePath}).` }],
+						details: { action: "push", mode: "remote", changed: true, repoUrl, remotePath, branch },
 					};
+				} finally {
+					await fs.rm(workdir, { recursive: true, force: true });
 				}
+			}
 
-				case "git_push_vault": {
-					await ensureFileExists(vaultPath, `Vault file not found at ${vaultPath}. Store at least one secret first.`);
-					const commitMessage =
-						input.commitMessage?.trim() || `[pi-cryptex] update vault ${new Date().toISOString()}`;
+			if (!input.repoUrl || input.repoUrl.trim().length === 0) {
+				throw new Error("action=pull requires repoUrl");
+			}
 
-					if (!input.repoUrl || input.repoUrl.trim().length === 0) {
-						// Push in current repository.
-						runGit(ctx.cwd, ["rev-parse", "--is-inside-work-tree"]);
-						const localVaultPath = sanitizeRelativePath(path.relative(ctx.cwd, vaultPath), "vault path");
-						runGit(ctx.cwd, ["add", "--", localVaultPath]);
-						const status = runGit(ctx.cwd, ["status", "--porcelain", "--", localVaultPath]);
-						if (!status.trim()) {
-							return {
-								content: [{ type: "text", text: "Vault is already up to date in current git repository." }],
-								details: { action: "git_push_vault", mode: "local", changed: false },
-							};
-						}
-
-						runGit(ctx.cwd, ["commit", "-m", commitMessage, "--", localVaultPath]);
-						if (input.branch && input.branch.trim().length > 0) {
-							runGit(ctx.cwd, ["push", "origin", input.branch.trim()]);
-						} else {
-							runGit(ctx.cwd, ["push"]);
-						}
-
-						return {
-							content: [{ type: "text", text: `Pushed ${localVaultPath} from current repository.` }],
-							details: { action: "git_push_vault", mode: "local", changed: true },
-						};
-					}
-
-					// Push to dedicated remote repo.
-					const repoUrl = input.repoUrl.trim();
-					const branch = input.branch?.trim();
-					const remotePath = sanitizeRelativePath(input.remotePath || VAULT_DEFAULT_GIT_PATH, "remotePath");
-					const workdir = await fs.mkdtemp(path.join(tmpdir(), "pi-cryptex-"));
+			const repoUrl = input.repoUrl.trim();
+			const branch = input.branch?.trim();
+			const remotePath = sanitizeRelativePath(input.remotePath || VAULT_DEFAULT_GIT_PATH, "remotePath");
+			const workdir = await fs.mkdtemp(path.join(tmpdir(), "pi-cryptex-"));
+			try {
+				runGit(ctx.cwd, ["clone", "--depth", "1", repoUrl, workdir]);
+				if (branch && branch.length > 0) {
 					try {
-						runGit(ctx.cwd, ["clone", "--depth", "1", repoUrl, workdir]);
-						if (branch && branch.length > 0) {
-							try {
-								runGit(workdir, ["checkout", branch]);
-							} catch {
-								runGit(workdir, ["checkout", "-b", branch]);
-							}
-						}
-
-						const target = path.join(workdir, remotePath);
-						await fs.mkdir(path.dirname(target), { recursive: true });
-						const bytes = await fs.readFile(vaultPath);
-						await fs.writeFile(target, bytes, { mode: 0o600 });
-
-						runGit(workdir, ["add", "--", remotePath]);
-						const status = runGit(workdir, ["status", "--porcelain", "--", remotePath]);
-						if (!status.trim()) {
-							return {
-								content: [{ type: "text", text: `Remote vault at ${remotePath} is already up to date.` }],
-								details: { action: "git_push_vault", mode: "remote", changed: false, repoUrl },
-							};
-						}
-
-						runGit(workdir, ["commit", "-m", commitMessage, "--", remotePath]);
-						if (branch && branch.length > 0) {
-							runGit(workdir, ["push", "origin", branch]);
-						} else {
-							runGit(workdir, ["push"]);
-						}
-
-						return {
-							content: [{ type: "text", text: `Pushed vault to ${repoUrl} (${remotePath}).` }],
-							details: { action: "git_push_vault", mode: "remote", changed: true, repoUrl, remotePath, branch },
-						};
-					} finally {
-						await fs.rm(workdir, { recursive: true, force: true });
+						runGit(workdir, ["checkout", branch]);
+					} catch {
+						throw new Error(`Branch ${branch} not found in ${repoUrl}`);
 					}
 				}
 
-				case "git_pull_vault": {
-					if (!input.repoUrl || input.repoUrl.trim().length === 0) {
-						throw new Error("action=git_pull_vault requires repoUrl");
-					}
+				const source = path.join(workdir, remotePath);
+				await ensureFileExists(source, `Remote vault not found at ${remotePath} in ${repoUrl}`);
+				await fs.mkdir(path.dirname(vaultPath), { recursive: true });
+				const bytes = await fs.readFile(source);
+				await fs.writeFile(vaultPath, bytes, { mode: 0o600 });
+				await fs.chmod(vaultPath, 0o600);
 
-					const repoUrl = input.repoUrl.trim();
-					const branch = input.branch?.trim();
-					const remotePath = sanitizeRelativePath(input.remotePath || VAULT_DEFAULT_GIT_PATH, "remotePath");
-					const workdir = await fs.mkdtemp(path.join(tmpdir(), "pi-cryptex-"));
-					try {
-						runGit(ctx.cwd, ["clone", "--depth", "1", repoUrl, workdir]);
-						if (branch && branch.length > 0) {
-							try {
-								runGit(workdir, ["checkout", branch]);
-							} catch {
-								throw new Error(`Branch ${branch} not found in ${repoUrl}`);
-							}
-						}
-
-						const source = path.join(workdir, remotePath);
-						await ensureFileExists(source, `Remote vault not found at ${remotePath} in ${repoUrl}`);
-						await fs.mkdir(path.dirname(vaultPath), { recursive: true });
-						const bytes = await fs.readFile(source);
-						await fs.writeFile(vaultPath, bytes, { mode: 0o600 });
-						await fs.chmod(vaultPath, 0o600);
-
-						return {
-							content: [{ type: "text", text: `Pulled vault from ${repoUrl} (${remotePath}) to ${normalizePath(ctx.cwd, vaultPath)}.` }],
-							details: { action: "git_pull_vault", repoUrl, remotePath, branch },
-						};
-					} finally {
-						await fs.rm(workdir, { recursive: true, force: true });
-					}
-				}
-
-				default:
-					throw new Error(`Unsupported action: ${String((input as { action?: unknown }).action)}`);
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Pulled vault from ${repoUrl} (${remotePath}) to ${normalizePath(ctx.cwd, vaultPath)}.`,
+						},
+					],
+					details: { action: "pull", repoUrl, remotePath, branch },
+				};
+			} finally {
+				await fs.rm(workdir, { recursive: true, force: true });
 			}
 		},
 	});

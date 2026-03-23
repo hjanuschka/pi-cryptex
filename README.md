@@ -35,9 +35,9 @@ pi install .
 - `/cryptex-backup-pi [profile]` - backup `~/.pi/agent` auth/login state into cryptex
 - `/cryptex-restore-pi [profile]` - restore auth/login state from cryptex
 
-## Tool
+## Tools (all prefixed)
 
-Tool name: `cryptex_vault`
+### `cryptex_vault`
 
 Actions:
 
@@ -49,25 +49,33 @@ Actions:
 - `list` - list keys
 - `nuke` - delete all keys
 - `rotate_password` - re-encrypt vault with a new password
-- `backup_pi_state` - backup selected files from `~/.pi/agent` into cryptex
-- `restore_pi_state` - restore selected files from cryptex into `~/.pi/agent`
-- `git_push_vault` - commit/push vault to git (current repo or dedicated remote)
-- `git_pull_vault` - pull vault from dedicated remote git repo
 
-### Default pi state files
+### `cryptex_pi_state`
 
-`backup_pi_state` defaults to:
+Actions:
+
+- `backup` - backup selected files from `~/.pi/agent` into cryptex
+- `restore` - restore selected files from cryptex into `~/.pi/agent`
+
+Default backup paths:
 
 - `auth.json`
 - `multi-pass.json` (for `pi-multi-pass` subscriptions, pools, chains)
 - `settings.json`
 
-`restore_pi_state` defaults to:
+Default restore paths:
 
 - `auth.json`
 - `multi-pass.json`
 
 You can override with `paths`.
+
+### `cryptex_git_sync`
+
+Actions:
+
+- `push` - commit/push vault to git (current repo or dedicated remote)
+- `pull` - pull vault from dedicated remote git repo
 
 ## Example prompts
 
@@ -87,5 +95,5 @@ Pull the cryptex vault from git@github.com:me/my-cryptex-secrets.git and restore
 
 - The vault uses `aes-256-gcm` with `scrypt` key derivation.
 - If `reveal=true` is used for reads, plaintext secrets enter model context/session history.
-- `backup_pi_state` stores raw contents of files like `auth.json`; keep vault password strong.
+- `cryptex_pi_state backup` stores raw contents of files like `auth.json`; keep vault password strong.
 - After restore, restart `pi` if auth or multi-pass state is not picked up immediately.
