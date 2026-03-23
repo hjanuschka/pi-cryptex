@@ -44,6 +44,7 @@ const CryptexPiStateParamsSchema = Type.Object({
 	profile: Type.Optional(Type.String({ description: "Named profile. Stored under key pi_state:<profile>. Default: default" })),
 	paths: Type.Optional(Type.Array(Type.String(), { description: "Relative paths under ~/.pi/agent. Backup default: auth.json,multi-pass.json,settings.json. Restore default: auth.json,multi-pass.json" })),
 	overwrite: Type.Optional(Type.Boolean({ description: "For restore. If true, overwrite existing files in ~/.pi/agent." })),
+	password: Type.Optional(Type.String({ description: "Optional account vault password to avoid interactive prompt." })),
 });
 
 const CryptexGitSyncParamsSchema = Type.Object({
@@ -60,6 +61,7 @@ const CryptexAccountGitSyncParamsSchema = Type.Object({
 	branch: Type.Optional(Type.String({ description: "Optional git branch" })),
 	remotePath: Type.Optional(Type.String({ description: "Path to account vault file inside git repo. Default: cryptex-account.v1.enc" })),
 	commitMessage: Type.Optional(Type.String({ description: "Commit message for push. Optional." })),
+	password: Type.Optional(Type.String({ description: "Optional account vault password to avoid interactive prompt." })),
 });
 
 type CryptexVaultParams = Static<typeof CryptexVaultParamsSchema>;
@@ -491,7 +493,16 @@ export default function (pi: ExtensionAPI) {
 	const keychainServiceFor = (scope: VaultScope): string => (scope === "project" ? PROJECT_KEYCHAIN_SERVICE : ACCOUNT_KEYCHAIN_SERVICE);
 	const keychainAccountFor = (scope: VaultScope, cwd: string): string => (scope === "project" ? projectKeychainAccount(cwd) : accountKeychainAccount());
 
-	const resolvePassword = async (scope: VaultScope, ctx: ExtensionContext): Promise<string> => {
+	const resolvePassword = async (
+		scope: VaultScope,
+		ctx: ExtensionContext,
+		providedPassword?: string,
+	): Promise<string> => {
+		if (providedPassword && providedPassword.trim().length > 0) {
+			passwordCache[scope] = providedPassword;
+			return providedPassword;
+		}
+
 		const cached = passwordCache[scope];
 		if (cached) return cached;
 
@@ -506,6 +517,33 @@ export default function (pi: ExtensionAPI) {
 		if (fromKeychain) {
 			passwordCache[scope] = fromKeychain;
 			return fromKeychain;
+		}
+
+		const vaultPath = vaultPathFor(scope, ctx.cwd);
+		let vaultExists = false;
+		try {
+			const stat = await fs.stat(vaultPath);
+			vaultExists = stat.isFile();
+		} catch (error) {
+			const err = error as NodeJS.ErrnoException;
+			if (err.code !== "ENOENT") throw err;
+		}
+
+		if (vaultExists) {
+			if (!ctx.hasUI) {
+				throw new Error(`Password required. Set ${envVar} to unlock existing ${scope} vault at ${vaultPath}.`);
+			}
+			const title = scope === "project" ? "Project cryptex password required" : "Account cryptex password required";
+			ctx.ui.notify(`${scope} vault is encrypted and needs a password to unlock.`, "info");
+			const entered = await ctx.ui.input(title, "Enter existing password");
+			if (!entered || entered.trim().length === 0) {
+				throw new Error("Password cannot be empty");
+			}
+			passwordCache[scope] = entered;
+			if (writePasswordToKeychain(keychainServiceFor(scope), keychainAccountFor(scope, ctx.cwd), entered)) {
+				ctx.ui.notify(`Saved ${scope} password to macOS Keychain`, "info");
+			}
+			return entered;
 		}
 
 		const title = scope === "project" ? "Create project cryptex password" : "Create account cryptex password";
@@ -700,9 +738,19 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const input = params as CryptexPiStateParams;
 			const profile = normalizeProfile(input.profile);
-			const password = await resolvePassword("account", ctx);
+			let password = await resolvePassword("account", ctx, input.password);
 			const vaultPath = vaultPathFor("account", ctx.cwd);
-			const vault = await readVault(vaultPath, password);
+			let vault: VaultData;
+			try {
+				vault = await readVault(vaultPath, password);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				if (!ctx.hasUI || !message.includes("Unable to decrypt vault")) throw error;
+				passwordCache.account = undefined;
+				ctx.ui.notify("Account vault password failed, please enter it again.", "warning");
+				password = await resolvePassword("account", ctx);
+				vault = await readVault(vaultPath, password);
+			}
 
 			if (input.action === "backup") {
 				const paths = (input.paths && input.paths.length > 0 ? input.paths : PI_DEFAULT_BACKUP_PATHS).map(sanitizePiRelativePath);
@@ -758,6 +806,9 @@ export default function (pi: ExtensionAPI) {
 		parameters: CryptexAccountGitSyncParamsSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const input = params as CryptexAccountGitSyncParams;
+			if (input.password && input.password.trim().length > 0) {
+				passwordCache.account = input.password;
+			}
 			const repoUrl = input.repoUrl.trim();
 			const branch = input.branch?.trim();
 			const remotePath = sanitizeRelativePath(input.remotePath || ACCOUNT_VAULT_DEFAULT_GIT_PATH, "remotePath");
